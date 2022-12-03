@@ -1,7 +1,10 @@
 #include <stdio.h>
+#include <limits.h>
+#include <time.h>
+#include <stdlib.h>
 
 #define BUFFLEN 1024
-#define FILENAME "../testOne.atrace.out"
+#define FILENAME "../small-loop.atrace.out"
 
 enum ReplacementPolicy { FIFO, LRU, RAND };
 
@@ -17,57 +20,111 @@ typedef struct {
     unsigned int currentTime; // a counter; increment it each time translate() is called
     enum ReplacementPolicy policy; // an enum representing which replacement alg to use
     int numPageFaults; // the total number of page faults
+    int numReferences; // the total number of references to the page table
 } MemStruct;
 
-unsigned long translate(
-        PageTableEntry * pageTable, // the page table itself
-        unsigned long pageNum, // the virtual page being translated
-        unsigned long iPageNum, // the page of the instruction address corresponding to this data
-        // page; or zero if pageNum corresponds to an instruction address
-        MemStruct *memStruct // information about the virtual memory
-) {
-    //look at entries in page table and
+/**
+ * Determines a free frame to be used depending on the replacement policy.
+ * @param pageTable
+ * @param pageNum
+ * @param iFrameNum the frame number of the instructions if it is a data page
+ * @param memStruct the memory struct for this run includs what page replacement algorithm to use
+ * @return
+ */
+unsigned long getFreeFrame(PageTableEntry * pageTable, unsigned long pageNum, unsigned long iFrameNum, MemStruct *memStruct) {
+    // Declare variables to which page to fill for FIFO or LRU replacement policy
+    int earliestInTime = INT_MAX;
+    int FIFOIndex = -1;
+    int earliestUseTime = INT_MAX;
+    int LRUIndex = -1;
+
     PageTableEntry currentPage;
-    int matchingPathIndex = -1;
+    // Loop through page table
     for (int i = 0; i < memStruct->numFrames; ++i) {
         currentPage = pageTable[i];
-        if (currentPage.pageNum == pageNum) matchingPathIndex = i;
-    }
-        // if there is any entry with a matching page number of the address being translated, and for which the inUse
-        // flag is not zero, then there is no page fault
-        if (currentPage.pageNum == pageNum && currentPage.inUse != 0) {
-            printf("%s", "found matching page number\n");
+        if (currentPage.inUse == 0) { // if there is an unused page, put the page there
+            printf("%s %d\n", "found unused target frame: ", i);
             return i;
         }
-
-
-        // Notes any unused pages and their index
-        else if (indexOfFreeFrame == -1 && currentPage.inUse == 0) {
-            printf("%s", "found free page\n");
-            indexOfFreeFrame = i; // stops looking for more unused pages once one is found
+        else if (i != iFrameNum) { // Only checks frames that are not the instructions for the data
+            // FIFO
+            if (currentPage.inTime < earliestInTime) { // if currentPage is the earliest
+                earliestInTime = currentPage.inTime;
+                FIFOIndex = i;
+            }
+            // LRU
+            if (currentPage.useTime < earliestUseTime) {
+                earliestUseTime = currentPage.useTime;
+                LRUIndex = i;
+            }
         }
     }
-    //if page is not in the table, this is a page fault, increment numPageFaults counter
-    ++memStruct->numPageFaults;
 
-    //if there is an entry not in use then use that frame. set UseTime = currentTime increment the time counter and return the frame number
-    if (indexOfFreeFrame != -1) {
-        pageTable[indexOfFreeFrame].useTime = memStruct->currentTime;
-        pageTable[indexOfFreeFrame].inUse = 1;
-        ++memStruct->currentTime;
-        printf("%s", "inserted into free page\n");
+    //If no unused page, choose page based on replacement policy
+    if (memStruct->policy == FIFO) { // FIFO
+        printf("evict page in frame %d\n", FIFOIndex);
+        return FIFOIndex;
+    }
+    else if (memStruct->policy == LRU) { // LRU
 
-        return  indexOfFreeFrame;
+        return LRUIndex;
+    }
+    else { // random
+        int randomPage;
+        int searchingForPage = 1;
+        while(searchingForPage == 1) { // while loop so that instruction page is not evicted
+            randomPage = rand() % memStruct->numFrames;
+            if (randomPage != iFrameNum) {
+                printf("evict page in frame %d\n", randomPage);
+                searchingForPage = 0;
+                return randomPage;
+            }
+        }
+    }
+}
+
+/**
+ * Translates the virtual address into a physical address in the page table.
+ * @param pageTable the page table itself
+ * @param pageNum the virtual page being translated
+ * @param iFrameNum the frame number of the instruction address corresponding to this data page; or zero if pageNum corresponds to an instruction address
+ * @param memStruct information about the virtual memory
+ */
+unsigned long translate(PageTableEntry *pageTable, unsigned long pageNum, unsigned long iFrameNum, MemStruct *memStruct) {
+    ++memStruct->numReferences; // increment number of references
+
+    // Look at all entries in page table
+    PageTableEntry* currentPage;
+    for (int i = 0; i < memStruct->numFrames; ++i) {
+        currentPage = &pageTable[i];
+        if (currentPage->pageNum == pageNum && currentPage->inUse != 0) { // Check if page already exists
+            printf("page %lu : already in frame %d\n", pageNum, i);
+            currentPage->inUse = memStruct->currentTime;
+            return i;
+        }
     }
 
+    // If page is not in the table, this is a page fault, increment numPageFaults counter
+    ++memStruct->numPageFaults;
+    unsigned int freeFrameIndex = getFreeFrame(pageTable, pageNum, iFrameNum, memStruct);
 
-    unsigned long toReturn = 5;
-    return toReturn;
+    // Creates page to be added
+    PageTableEntry toAdd;
+    toAdd.inUse = 1;
+    toAdd.pageNum = pageNum;
+    toAdd.inTime = memStruct->currentTime;
+    toAdd.useTime = memStruct->currentTime;
+    pageTable[freeFrameIndex] = toAdd;
+    ++memStruct->currentTime;
+
+    printf("fault:page %lu -> frame %d\n", pageNum, freeFrameIndex);
+
+    return freeFrameIndex;
 }
 
 
 // From sscanf-example.c
-int readBuffer(PageTableEntry *pageTable, MemStruct *memStruct) {
+int readBuffer(PageTableEntry pageTable[], MemStruct *memStruct) {
     char buffer[BUFFLEN];
     char tmpbuf[64];
     unsigned long val1, val2;
@@ -83,43 +140,64 @@ int readBuffer(PageTableEntry *pageTable, MemStruct *memStruct) {
 
     unsigned long iPageNum;
     unsigned long dPageNum;
+    int iFrameNum;
+    int dFrameNum;
     chp = fgets(buffer, BUFFLEN, fp);
     while ( chp != NULL) {
         nf = sscanf(buffer, "%lx: %c %lx", &val1, tmpbuf, &val2);
         if (nf == 3) {
-            //calculate iPageNum and dPageNum
+            // Calculate iPageNum and dPageNum
             iPageNum = val1 / 4096;
             dPageNum = val2 / 4096;
-            translate(pageTable, val1, iPageNum, memStruct);
-            translate(pageTable, val2, dPageNum, memStruct);
+            iFrameNum = translate(pageTable, iPageNum, -1, memStruct);
+            dFrameNum = translate(pageTable, dPageNum, iFrameNum, memStruct);
 
-            // PageTableEntry * pageTable, // the page table itself
-            //        unsigned long pageNum, // the virtual page being translated
-            //        unsigned long iPageNum, // the page of the instruction address corresponding to this data
-            //        // page; or zero if pageNum corresponds to an instruction address
-            //        MemStruct *memStruct // information about the virtual memory
-            printf("%s", buffer);
-            printf("val1 = %lu; val2 = %lu\n", iPageNum, dPageNum);
+            printf("%lu -> %d | %lu -> %d\n", iPageNum, iFrameNum, dPageNum, dFrameNum);
         }
         chp = fgets(buffer, BUFFLEN, fp);
     }
-
     fclose(fp);
 
     return 0;
 }
 
 
-
 int main() {
-    MemStruct random;
-    random.numFrames = 6;
-    random.currentTime = 0;
-    random.policy = RAND;
-    random.numPageFaults = 0;
+    srand(time(NULL)); // For random
 
-    PageTableEntry pageTable[random.numFrames];
-    readBuffer(pageTable, &random);
+    // Create memory structure
+    MemStruct pagingAlgorithm;
+    pagingAlgorithm.numFrames = 32;
+    pagingAlgorithm.currentTime = 0;
+    pagingAlgorithm.policy = RAND;
+    pagingAlgorithm.numPageFaults = 0;
+    pagingAlgorithm.numReferences = 0;
+
+    // Create page table and populate with empty pages
+    PageTableEntry pageTable[pagingAlgorithm.numFrames];
+    for (int i = 0; i < pagingAlgorithm.numFrames; ++i) {
+        PageTableEntry page;
+        page.inUse = 0;
+        page.pageNum = -1;
+        pageTable[i] = page;
+    }
+
+    // Print memory structure info
+    printf("policy: %u - %d\n", pagingAlgorithm.policy);
+    printf("#frames = %d\n", pagingAlgorithm.numFrames);
+    printf("filename: %s\n", FILENAME);
+
+    // Reads file and populates page table
+    readBuffer(pageTable, &pagingAlgorithm);
+
+    // Print information about run
+    printf("\n#refs  = %d\n", pagingAlgorithm.numReferences);
+    printf("#faults  = %d\n\n", pagingAlgorithm.numPageFaults);
+
+    // Print the ending state of the page table
+    for (int i = 0; i < pagingAlgorithm.numFrames; ++i) {
+        printf("%lu -> %d\n", pageTable[i].pageNum, i);
+    }
 
     return 0;
 }
